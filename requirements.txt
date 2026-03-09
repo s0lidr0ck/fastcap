@@ -1,0 +1,4 @@
+faster-whisper>=1.0.0
+PySide6
+boto3
+scikit-learn

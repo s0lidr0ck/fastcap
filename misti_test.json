@@ -1,0 +1,44 @@
+{
+  "clips": [
+    {
+      "clip_number": 1,
+      "start_time": "00:02:41.579",
+      "end_time": "00:03:18.299"
+    },
+    {
+      "clip_number": 2,
+      "start_time": "00:05:46.060",
+      "end_time": "00:06:23.500"
+    },
+    {
+      "clip_number": 3,
+      "start_time": "00:11:20.620",
+      "end_time": "00:12:04.112"
+    },
+    {
+      "clip_number": 4,
+      "start_time": "00:18:14.220",
+      "end_time": "00:18:59.430"
+    },
+    {
+      "clip_number": 5,
+      "start_time": "00:24:33.015",
+      "end_time": "00:25:15.882"
+    },
+    {
+      "clip_number": 6,
+      "start_time": "00:31:10.402",
+      "end_time": "00:31:54.977"
+    },
+    {
+      "clip_number": 7,
+      "start_time": "00:39:02.610",
+      "end_time": "00:39:47.330"
+    },
+    {
+      "clip_number": 8,
+      "start_time": "00:44:18.050",
+      "end_time": "00:44:57.600"
+    }
+  ]
+}
