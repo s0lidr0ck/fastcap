@@ -87,10 +87,12 @@ from session_artifacts import (
     update_words_media_file,
 )
 from youtube_prompt import (
+    build_thumbnail_prompt_planner,
     build_youtube_prompt,
     build_youtube_prompt_with_chapters,
     format_youtube_chapters,
     get_chapter_segments,
+    parse_thumbnail_prompt_variants,
     parse_srt_to_chapters,
     parse_youtube_response,
     srt_to_plain_text,
@@ -803,7 +805,7 @@ class BlogPostWorker(QObject):
 class YouTubeWorker(QObject):
     log = Signal(str)
     progress = Signal(int, int, str)
-    done = Signal(bool, str, str, str)  # success, message, title, description
+    done = Signal(bool, str, str, str, object)  # success, message, title, description, thumbnail_prompts
 
     def __init__(
         self,
@@ -812,6 +814,7 @@ class YouTubeWorker(QObject):
         host: str = "",
         preacher_name: str = "",
         date_preached: str = "",
+        sermon_metadata: dict | None = None,
     ) -> None:
         super().__init__()
         self.transcript = transcript
@@ -819,6 +822,7 @@ class YouTubeWorker(QObject):
         self.host = host.strip()
         self.preacher_name = (preacher_name or "").strip()
         self.date_preached = (date_preached or "").strip()
+        self.sermon_metadata = sermon_metadata if isinstance(sermon_metadata, dict) else {}
 
     def run(self) -> None:
         try:
@@ -865,12 +869,40 @@ class YouTubeWorker(QObject):
                 description = f"{description.rstrip()}\n\n{chapter_block}".strip()
                 self.log.emit(f"Added {len(chapters_with_titles)} chapters (fallback titles).")
 
+            self.log.emit("Building thumbnail prompt planner...")
+            self.progress.emit(92, 100, "Planning thumbnails...")
+            thumbnail_planner_prompt = build_thumbnail_prompt_planner(
+                plain_transcript,
+                title,
+                description,
+                preacher_name=self.preacher_name,
+                date_preached=self.date_preached,
+                sermon_metadata=self.sermon_metadata,
+            )
+            thumbnail_raw = call_llm_generate(
+                model=self.model_name,
+                prompt=thumbnail_planner_prompt,
+                host=self.host or "http://127.0.0.1:11434",
+            )
+            thumbnail_prompts = parse_thumbnail_prompt_variants(
+                thumbnail_raw or "",
+                youtube_title=title,
+                youtube_description=description,
+                sermon_metadata=self.sermon_metadata,
+            )
+            self.log.emit(f"Prepared {len(thumbnail_prompts)} thumbnail prompt variants.")
             self.progress.emit(100, 100, "Completed")
-            self.log.emit("YouTube title and description generated.")
-            self.done.emit(True, "YouTube title and description generated.", title, description)
+            self.log.emit("YouTube title, description, and thumbnail prompts generated.")
+            self.done.emit(
+                True,
+                "YouTube title, description, and thumbnail prompts generated.",
+                title,
+                description,
+                thumbnail_prompts,
+            )
         except Exception as exc:
             logging.error("YouTube worker failed: %s", traceback.format_exc())
-            self.done.emit(False, str(exc), "", "")
+            self.done.emit(False, str(exc), "", "", [])
 
 
 class FacebookPostWorker(QObject):
@@ -949,6 +981,11 @@ class MainWindow(QMainWindow):
         self._blog_speaker_preset: dict | None = None
         self._blog_source_path: Path | None = None
         self._youtube_source_path: Path | None = None
+        self._youtube_thumbnail_prompts: list[dict[str, str]] = []
+        self._youtube_thumbnail_toggle_buttons: list[QPushButton] = []
+        self._youtube_thumbnail_prompt_edits: list[QPlainTextEdit] = []
+        self._youtube_thumbnail_copy_buttons: list[QPushButton] = []
+        self._youtube_thumbnail_collapsed_labels: list[str] = []
         self._caption_output_overridden = False
         self._clips_output_overridden = False
         self._preview_suppress_autoplay = False
@@ -1155,7 +1192,7 @@ class MainWindow(QMainWindow):
         self.session_meta_label.setWordWrap(True)
         self.session_status_label = QLabel("Prepare: not started\nReview: not started\nPublish: not started")
         self.session_status_label.setWordWrap(True)
-        self.session_load_btn = QPushButton("Load Session")
+        self.session_load_btn = QPushButton("Load Folder/Video")
         self.session_load_btn.clicked.connect(self.pick_session_folder)
         self.session_open_btn = QPushButton("Open Folder")
         self.session_open_btn.setEnabled(False)
@@ -1722,6 +1759,9 @@ class MainWindow(QMainWindow):
         youtube_copy_desc_btn.clicked.connect(self._youtube_copy_description)
         youtube_copy_both_btn = QPushButton("Copy both")
         youtube_copy_both_btn.clicked.connect(self._youtube_copy_both)
+        self.youtube_copy_all_thumbnail_btn = QPushButton("Copy all prompts")
+        self.youtube_copy_all_thumbnail_btn.setEnabled(False)
+        self.youtube_copy_all_thumbnail_btn.clicked.connect(self._youtube_copy_all_thumbnail_prompts)
         youtube_open_studio_btn = QPushButton("Open YouTube Studio")
         youtube_open_studio_btn.clicked.connect(self._youtube_open_studio)
         youtube_clear_btn = QPushButton("Clear")
@@ -1754,6 +1794,7 @@ class MainWindow(QMainWindow):
         controls.addWidget(youtube_copy_title_btn)
         controls.addWidget(youtube_copy_desc_btn)
         controls.addWidget(youtube_copy_both_btn)
+        controls.addWidget(self.youtube_copy_all_thumbnail_btn)
         controls.addWidget(youtube_open_studio_btn)
         controls.addWidget(youtube_clear_btn)
         controls.addStretch(1)
@@ -1764,6 +1805,57 @@ class MainWindow(QMainWindow):
         out_layout.addWidget(self.youtube_title_edit)
         out_layout.addWidget(QLabel("Description:"))
         out_layout.addWidget(self.youtube_description_edit, stretch=1)
+        thumbnail_group = QGroupBox("Thumbnail prompts")
+        thumbnail_content = QWidget()
+        thumbnail_layout = QHBoxLayout(thumbnail_content)
+        thumbnail_layout.setContentsMargins(0, 0, 0, 0)
+        thumbnail_layout.setSpacing(8)
+        self._youtube_thumbnail_toggle_buttons = []
+        self._youtube_thumbnail_prompt_edits = []
+        self._youtube_thumbnail_copy_buttons = []
+        self._youtube_thumbnail_collapsed_labels = []
+        for index, label in enumerate(("A", "B", "C")):
+            section = QWidget()
+            section.setMinimumWidth(180)
+            section_layout = QVBoxLayout(section)
+            section_layout.setContentsMargins(0, 0, 0, 0)
+            section_layout.setSpacing(4)
+
+            header_layout = QHBoxLayout()
+            header_layout.setContentsMargins(0, 0, 0, 0)
+            toggle = QPushButton(f"Variant {label}")
+            toggle.setCheckable(True)
+            toggle.setObjectName("inlineToggleButton")
+            toggle.setChecked(False)
+            toggle.setToolTip(f"Expand to view or edit prompt for Variant {label}")
+            copy_btn = QPushButton("Copy")
+            copy_btn.setEnabled(False)
+            copy_btn.clicked.connect(lambda checked=False, target=index: self._youtube_copy_thumbnail_variant(target))
+            header_layout.addWidget(toggle, stretch=1)
+            header_layout.addWidget(copy_btn)
+
+            prompt_edit = QPlainTextEdit()
+            prompt_edit.setReadOnly(True)
+            prompt_edit.setPlaceholderText(f"Prompt for Variant {label}")
+            prompt_edit.setFont(mono)
+            self._set_text_panel_height(prompt_edit, 100, 140)
+            prompt_edit.hide()
+
+            toggle.clicked.connect(
+                lambda checked=False, target=index: self._set_youtube_thumbnail_section_state(target, checked)
+            )
+
+            section_layout.addLayout(header_layout)
+            section_layout.addWidget(prompt_edit)
+            thumbnail_layout.addWidget(section, 1)
+
+            self._youtube_thumbnail_toggle_buttons.append(toggle)
+            self._youtube_thumbnail_prompt_edits.append(prompt_edit)
+            self._youtube_thumbnail_copy_buttons.append(copy_btn)
+            self._youtube_thumbnail_collapsed_labels.append(f"Variant {label}")
+        thumb_group_layout = QVBoxLayout(thumbnail_group)
+        thumb_group_layout.setContentsMargins(8, 8, 8, 8)
+        thumb_group_layout.addWidget(thumbnail_content)
         logs_group = QGroupBox("Progress / Log")
         logs_group.setLayout(QVBoxLayout())
         logs_group.layout().addWidget(self.youtube_log)
@@ -1773,6 +1865,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(controls)
         layout.addWidget(self.youtube_progress)
         layout.addWidget(output_group, stretch=1)
+        layout.addWidget(thumbnail_group)
         self._add_collapsible_section(layout, "Activity Log", logs_group, expanded=False)
 
     def _build_facebook_tab(self) -> None:
@@ -1952,6 +2045,23 @@ class MainWindow(QMainWindow):
         if self._current_asset_dir is not None:
             return ""
         return self.sermon_transcript_edit.toPlainText().strip()
+
+    def _get_publish_sermon_metadata(self) -> dict | None:
+        if isinstance(self._sermon_last_parsed, dict) and self._sermon_last_parsed:
+            return self._sermon_last_parsed
+        asset_dir = self._current_asset_dir or self._resolve_current_asset_dir()
+        if asset_dir is None:
+            return None
+        session = self._current_session or load_session(asset_dir) or {}
+        path = artifact_path(asset_dir, "sermon_metadata", session=session)
+        if not path.is_file():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        parsed_payload = payload.get("parsed_payload") if isinstance(payload, dict) else None
+        return parsed_payload if isinstance(parsed_payload, dict) else None
 
     def _get_publish_blog_markdown(self) -> str:
         if self._blog_last_markdown.strip():
@@ -2149,10 +2259,64 @@ class MainWindow(QMainWindow):
         self.clips_json_edit.setPlainText(json.dumps(payload, ensure_ascii=False, indent=2))
         return True
 
+    def _pick_asset_folder_or_video(self, title: str) -> Path | None:
+        chooser = QMessageBox(self)
+        chooser.setWindowTitle(title)
+        chooser.setIcon(QMessageBox.Question)
+        chooser.setText("Choose an existing asset folder or a source video file.")
+        chooser.setInformativeText(
+            "Selecting a video will reuse or create its working folder automatically."
+        )
+        folder_button = chooser.addButton("Asset Folder...", QMessageBox.AcceptRole)
+        video_button = chooser.addButton("Video File...", QMessageBox.AcceptRole)
+        chooser.addButton(QMessageBox.Cancel)
+        chooser.exec()
+
+        clicked = chooser.clickedButton()
+        if clicked is folder_button:
+            path = QFileDialog.getExistingDirectory(self, "Select asset folder")
+            return Path(path).resolve() if path else None
+        if clicked is video_button:
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select video file",
+                "",
+                "Video files (*.mp4 *.mov *.mkv *.avi *.webm *.m4v);;All files (*.*)",
+            )
+            return Path(path).resolve() if path else None
+        return None
+
+    def _resolve_asset_dir_input(
+        self,
+        selected_path: Path,
+        *,
+        create_if_missing: bool = False,
+    ) -> tuple[Path | None, Path | None]:
+        path = selected_path.resolve()
+        if path.is_dir():
+            return path, None
+        if path.is_file():
+            if not is_video_path(path):
+                QMessageBox.critical(
+                    self,
+                    "Unsupported file",
+                    f"Please choose an asset folder or a supported video file:\n{path}",
+                )
+                return None, None
+            asset_dir = get_video_asset_dir(path)
+            if create_if_missing:
+                asset_dir.mkdir(parents=True, exist_ok=True)
+            return asset_dir, path
+        QMessageBox.critical(self, "Missing path", f"Selected path was not found:\n{path}")
+        return None, None
+
     def pick_session_folder(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Select asset folder")
-        if path:
-            self.load_session_into_ui(Path(path).resolve())
+        selection = self._pick_asset_folder_or_video("Load session or source video")
+        if selection is None:
+            return
+        asset_dir, source_video = self._resolve_asset_dir_input(selection, create_if_missing=True)
+        if asset_dir is not None:
+            self.load_session_into_ui(asset_dir, source_video=source_video)
 
     def open_current_session_folder(self) -> None:
         if self._current_asset_dir is None or not self._current_asset_dir.is_dir():
@@ -2357,6 +2521,14 @@ class MainWindow(QMainWindow):
 
         session = self._current_session or load_session(self._current_asset_dir) or {}
         video_path = resolve_main_video_path(self._current_asset_dir, session=session)
+        if video_path is None:
+            for raw_path in [self.caption_video_edit.text().strip(), self.clips_video_edit.text().strip()]:
+                if not raw_path:
+                    continue
+                candidate = Path(raw_path).resolve()
+                if candidate.is_file() and is_video_path(candidate):
+                    video_path = candidate
+                    break
         self.session_video_label.setText(video_path.name if video_path is not None else "No source video loaded")
 
         speaker = session.get("speaker", {}) if isinstance(session.get("speaker", {}), dict) else {}
@@ -2406,15 +2578,26 @@ class MainWindow(QMainWindow):
             self.blog_name_edit.setText(canonical)
             self.youtube_name_edit.setText(canonical)
 
-    def load_session_into_ui(self, asset_dir: Path) -> None:
+    def load_session_into_ui(self, asset_dir: Path, source_video: Path | None = None) -> None:
         asset_dir = asset_dir.resolve()
-        if not asset_dir.is_dir():
-            QMessageBox.critical(self, "Missing folder", f"Asset folder not found:\n{asset_dir}")
+        source_video = source_video.resolve() if source_video is not None else None
+        if source_video is not None and (not source_video.is_file() or not is_video_path(source_video)):
+            QMessageBox.critical(self, "Missing file", f"Video file not found:\n{source_video}")
             return
+        if not asset_dir.is_dir():
+            if source_video is None:
+                QMessageBox.critical(self, "Missing folder", f"Asset folder not found:\n{asset_dir}")
+                return
+            asset_dir.mkdir(parents=True, exist_ok=True)
+        self._preview_video_path = None
+        self.preview_player.setSource(QUrl())
+        self.preview_player.setPosition(0)
         self._loaded_step_flags.clear()
         self._set_current_asset_dir(asset_dir)
         session = self._current_session or {}
         self._apply_session_metadata(session)
+        self.caption_video_edit.clear()
+        self.clips_video_edit.clear()
         self.sermon_transcript_edit.clear()
         self.blog_transcript_edit.clear()
         self.youtube_transcript_edit.clear()
@@ -2423,6 +2606,8 @@ class MainWindow(QMainWindow):
         self.blog_output_edit.clear()
         self.youtube_title_edit.clear()
         self.youtube_description_edit.clear()
+        self._youtube_thumbnail_prompts = []
+        self._set_youtube_thumbnail_prompts([])
         self.facebook_output_edit.clear()
         self._sermon_last_transcript = ""
         self._sermon_last_raw = ""
@@ -2433,6 +2618,8 @@ class MainWindow(QMainWindow):
         self.blog_open_wix_btn.setEnabled(False)
 
         video_path = resolve_main_video_path(asset_dir, session=session)
+        if video_path is None and source_video is not None:
+            video_path = source_video
         if video_path is not None and video_path.is_file():
             self.caption_video_edit.setText(str(video_path))
             self.clips_video_edit.setText(str(video_path))
@@ -2507,6 +2694,7 @@ class MainWindow(QMainWindow):
             if isinstance(payload, dict):
                 self.youtube_title_edit.setText(str(payload.get("title", "")).strip())
                 self.youtube_description_edit.setPlainText(str(payload.get("description", "")).strip())
+                self._set_youtube_thumbnail_prompts(payload.get("thumbnail_prompts"))
                 transcript = str(payload.get("transcript", "")).strip()
                 if transcript:
                     self.youtube_transcript_edit.setPlainText(transcript)
@@ -2959,6 +3147,8 @@ class MainWindow(QMainWindow):
     def _clear_youtube_tab(self) -> None:
         self.youtube_title_edit.clear()
         self.youtube_description_edit.clear()
+        self._youtube_thumbnail_prompts = []
+        self._set_youtube_thumbnail_prompts([])
         self.youtube_log.clear()
         self.youtube_progress.setValue(0)
         self._youtube_source_path = None
@@ -2991,6 +3181,7 @@ class MainWindow(QMainWindow):
         date_preached = self.youtube_date_edit.date().toString("yyyy-MM-dd")
         model_name = self.youtube_model_combo.currentText().strip()
         host = self.youtube_host_edit.text().strip()
+        sermon_metadata = self._get_publish_sermon_metadata()
         asset_dir = self._resolve_current_asset_dir()
         if asset_dir is None:
             QMessageBox.critical(self, "Missing session", "Load or create an asset folder before generating YouTube copy.")
@@ -3020,6 +3211,8 @@ class MainWindow(QMainWindow):
         self.youtube_log.clear()
         self.youtube_title_edit.clear()
         self.youtube_description_edit.clear()
+        self._youtube_thumbnail_prompts = []
+        self._set_youtube_thumbnail_prompts([])
         self.youtube_progress.setMaximum(100)
         self.youtube_progress.setValue(0)
         self._set_busy(True)
@@ -3029,6 +3222,7 @@ class MainWindow(QMainWindow):
             host=host,
             preacher_name=preacher_name or "",
             date_preached=date_preached,
+            sermon_metadata=sermon_metadata,
         )
         worker.log.connect(self._on_youtube_log)
         worker.progress.connect(self._on_youtube_progress)
@@ -3042,17 +3236,91 @@ class MainWindow(QMainWindow):
         self.youtube_progress.setValue(min(current, max(total, 1)))
         self.youtube_progress.setFormat(label)
 
-    def _on_youtube_done(self, success: bool, message: str, title: str, description: str) -> None:
+    def _coerce_thumbnail_prompt_variants(self, payload: object) -> list[dict[str, str]]:
+        if not isinstance(payload, list):
+            return []
+        prompts: list[dict[str, str]] = []
+        for index, item in enumerate(payload):
+            if not isinstance(item, dict):
+                continue
+            prompt_text = str(item.get("prompt", "")).strip()
+            if not prompt_text:
+                continue
+            prompts.append(
+                {
+                    "label": str(item.get("label", "")).strip() or chr(ord("A") + index),
+                    "sermon_title": str(item.get("sermon_title", "")).strip(),
+                    "sermon_summary": str(item.get("sermon_summary", "")).strip(),
+                    "sermon_theme": str(item.get("sermon_theme", "")).strip(),
+                    "thumbnail_phrase": str(item.get("thumbnail_phrase", "")).strip(),
+                    "scene_concept": str(item.get("scene_concept", "")).strip(),
+                    "text_position": str(item.get("text_position", "")).strip(),
+                    "lighting_description": str(item.get("lighting_description", "")).strip(),
+                    "prompt": prompt_text,
+                }
+            )
+        return prompts
+
+    def _set_youtube_thumbnail_prompts(self, payload: object) -> None:
+        prompts = self._coerce_thumbnail_prompt_variants(payload)
+        self._youtube_thumbnail_prompts = prompts
+        if not self._youtube_thumbnail_toggle_buttons:
+            return
+        has_prompts = bool(prompts)
+        self.youtube_copy_all_thumbnail_btn.setEnabled(has_prompts)
+        for index, toggle in enumerate(self._youtube_thumbnail_toggle_buttons):
+            label = chr(ord("A") + index)
+            prompt_edit = self._youtube_thumbnail_prompt_edits[index]
+            copy_btn = self._youtube_thumbnail_copy_buttons[index]
+            if index < len(prompts):
+                prompt = prompts[index]
+                phrase = prompt.get("thumbnail_phrase", "").strip()
+                collapsed_label = f"Variant {label} - {phrase}" if phrase else f"Variant {label}"
+                self._youtube_thumbnail_collapsed_labels[index] = collapsed_label
+                prompt_edit.setPlainText(prompt.get("prompt", "").strip())
+                toggle.setEnabled(True)
+                copy_btn.setEnabled(True)
+                self._set_youtube_thumbnail_section_state(index, index == 0)
+            else:
+                self._youtube_thumbnail_collapsed_labels[index] = f"Variant {label}"
+                prompt_edit.clear()
+                toggle.setEnabled(False)
+                copy_btn.setEnabled(False)
+                self._set_youtube_thumbnail_section_state(index, False)
+
+    def _set_youtube_thumbnail_section_state(self, index: int, expanded: bool) -> None:
+        if index < 0 or index >= len(self._youtube_thumbnail_toggle_buttons):
+            return
+        toggle = self._youtube_thumbnail_toggle_buttons[index]
+        prompt_edit = self._youtube_thumbnail_prompt_edits[index]
+        label = chr(ord("A") + index)
+        collapsed_label = self._youtube_thumbnail_collapsed_labels[index] if index < len(self._youtube_thumbnail_collapsed_labels) else f"Variant {label}"
+        toggle.blockSignals(True)
+        toggle.setChecked(expanded)
+        toggle.setText(f"Hide Variant {label}" if expanded and toggle.isEnabled() else collapsed_label)
+        toggle.blockSignals(False)
+        prompt_edit.setVisible(expanded and toggle.isEnabled())
+
+    def _on_youtube_done(
+        self,
+        success: bool,
+        message: str,
+        title: str,
+        description: str,
+        thumbnail_prompts: object,
+    ) -> None:
         self._set_busy(False)
         if success:
             self.youtube_title_edit.setText(title)
             self.youtube_description_edit.setPlainText(description)
+            self._set_youtube_thumbnail_prompts(thumbnail_prompts)
             asset_dir = self._resolve_current_asset_dir()
             if asset_dir is not None:
                 youtube_path = artifact_path(asset_dir, "youtube", session=load_session(asset_dir))
                 payload = {
                     "title": title,
                     "description": description,
+                    "thumbnail_prompts": self._youtube_thumbnail_prompts,
                     "transcript": self._get_publish_transcript(),
                     "name": self.youtube_name_edit.text().strip(),
                     "speaker_prompt_name": self.youtube_speaker_combo.currentText().strip(),
@@ -3079,8 +3347,12 @@ class MainWindow(QMainWindow):
                 )
                 self._loaded_step_flags.add("youtube")
             self._append_log(self.youtube_log, message)
-            self.statusBar().showMessage("YouTube title and description ready. Copy and upload in YouTube Studio.", 6000)
+            self.statusBar().showMessage(
+                "YouTube copy and thumbnail prompts ready. Copy them into YouTube Studio and your image generator.",
+                6000,
+            )
         else:
+            self._set_youtube_thumbnail_prompts([])
             asset_dir = self._resolve_current_asset_dir()
             self._write_step_status(asset_dir, "youtube", "failed", error=message)
             self._append_log(self.youtube_log, f"ERROR: {message}")
@@ -3105,6 +3377,30 @@ class MainWindow(QMainWindow):
         if title or desc:
             QApplication.clipboard().setText(f"{title}\n\n{desc}" if title and desc else (title or desc))
             self.statusBar().showMessage("Title and description copied to clipboard.", 3000)
+
+    def _youtube_copy_thumbnail_variant(self, index: int) -> None:
+        if not self._youtube_thumbnail_prompts:
+            return
+        if index < 0 or index >= len(self._youtube_thumbnail_prompts):
+            return
+        prompt_text = self._youtube_thumbnail_prompts[index].get("prompt", "").strip()
+        if prompt_text:
+            QApplication.clipboard().setText(prompt_text)
+            label = self._youtube_thumbnail_prompts[index].get("label", "").strip() or chr(ord("A") + index)
+            self.statusBar().showMessage(f"Thumbnail prompt {label} copied to clipboard.", 3000)
+
+    def _youtube_copy_all_thumbnail_prompts(self) -> None:
+        if not self._youtube_thumbnail_prompts:
+            return
+        blocks = []
+        for index, prompt in enumerate(self._youtube_thumbnail_prompts):
+            label = prompt.get("label", "").strip() or chr(ord("A") + index)
+            prompt_text = prompt.get("prompt", "").strip()
+            if prompt_text:
+                blocks.append(f"Variant {label}\n{prompt_text}")
+        if blocks:
+            QApplication.clipboard().setText("\n\n".join(blocks))
+            self.statusBar().showMessage("All thumbnail prompts copied to clipboard.", 3000)
 
     def _youtube_open_studio(self) -> None:
         QDesktopServices.openUrl(QUrl("https://studio.youtube.com"))
@@ -3216,7 +3512,9 @@ class MainWindow(QMainWindow):
 
     def _build_rank_tab(self) -> None:
         self.rank_folder_edit = QLineEdit()
-        self.rank_folder_edit.setPlaceholderText("Folder containing words.json/energy.json/cadence.json/moments.json")
+        self.rank_folder_edit.setPlaceholderText(
+            "Asset folder or source video (auto-resolves/creates working folder)"
+        )
         self.rank_model_combo = QComboBox()
         self.rank_model_combo.addItems(
             [
@@ -3264,7 +3562,7 @@ class MainWindow(QMainWindow):
         grid.setHorizontalSpacing(10)
         grid.setVerticalSpacing(10)
 
-        grid.addWidget(QLabel("Asset folder:"), 0, 0)
+        grid.addWidget(QLabel("Asset folder or video:"), 0, 0)
         grid.addWidget(self.rank_folder_edit, 0, 1)
         browse_folder = QPushButton("Browse...")
         browse_folder.clicked.connect(self.pick_rank_folder)
@@ -4136,9 +4434,12 @@ class MainWindow(QMainWindow):
         self.rank_results.clear()
 
     def pick_rank_folder(self) -> None:
-        path = QFileDialog.getExistingDirectory(self, "Select asset folder")
-        if path:
-            self.load_session_into_ui(Path(path).resolve())
+        selection = self._pick_asset_folder_or_video("Select asset folder or video")
+        if selection is None:
+            return
+        asset_dir, source_video = self._resolve_asset_dir_input(selection, create_if_missing=True)
+        if asset_dir is not None:
+            self.load_session_into_ui(asset_dir, source_video=source_video)
 
     def _resolve_preview_source_video(self, rank_result: dict) -> Path | None:
         if self._preview_video_path is not None and self._preview_video_path.is_file():
@@ -5064,13 +5365,16 @@ class MainWindow(QMainWindow):
         output_count = int(self.rank_output_spin.value())
 
         if not folder_raw:
-            QMessageBox.critical(self, "Missing input", "Please select the asset folder.")
+            QMessageBox.critical(self, "Missing input", "Please select an asset folder or video file.")
             return
 
-        asset_dir = Path(folder_raw).resolve()
-        if not asset_dir.is_dir():
-            QMessageBox.critical(self, "Missing folder", f"Asset folder not found:\n{asset_dir}")
+        asset_dir, source_video = self._resolve_asset_dir_input(Path(folder_raw), create_if_missing=True)
+        if asset_dir is None:
             return
+        self.rank_folder_edit.setText(str(asset_dir))
+        if source_video is not None:
+            self.caption_video_edit.setText(str(source_video))
+            self.clips_video_edit.setText(str(source_video))
 
         missing_files = [
             name

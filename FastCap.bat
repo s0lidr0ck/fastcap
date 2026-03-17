@@ -26,7 +26,7 @@ if not "%ERRORLEVEL%"=="0" (
 )
 
 echo FastCap log file: %LOG_FILE%
-%PY_EXE% -X faulthandler "extract_clips_gui.py" --log-file "%LOG_FILE%"
+%PY_EXE% -X faulthandler "FastCap.pyw" --log-file "%LOG_FILE%"
 
 set EXITCODE=%ERRORLEVEL%
 if not "%EXITCODE%"=="0" (

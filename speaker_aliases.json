@@ -1,4 +1,8 @@
 [
+  { "canonical": "Chris Tidwell", "promptName": "Pastor Chris" },
+  { "canonical": "Keith Adcock", "promptName": "Bro. Keith" },
   { "canonical": "Misti Sanders", "promptName": "Sis. Misti" },
-  { "canonical": "Chris Tidwell", "promptName": "Pastor Chris" }
+  { "canonical": "Ashley Sutley", "promptName": "Bro. Ashley" },
+  { "canonical": "Alex Golden", "promptName": "Bro. Alex" },
+  { "canonical": "Jason Burch", "promptName": "Bro. Jason" }
 ]
